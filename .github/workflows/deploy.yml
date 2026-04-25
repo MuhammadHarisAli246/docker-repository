@@ -1,4 +1,4 @@
-﻿name: Deploy To ECS
+name: Deploy To ECS
 
 on:
   push:
@@ -120,6 +120,45 @@ jobs:
         run: terraform init -input=false -backend-config=backend.hcl
         working-directory: infra/terraform
 
+      - name: Import existing AWS resources into Terraform state
+        working-directory: infra/terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          import_if_exists() {
+            local resource="$1"
+            local id="$2"
+            if terraform state show "${resource}" &>/dev/null; then
+              echo "SKIP  ${resource} already in state"
+            else
+              echo "IMPORT ${resource} => ${id}"
+              terraform import "${resource}" "${id}" || true
+            fi
+          }
+
+          # ECR Repositories
+          import_if_exists 'aws_ecr_repository.service["cart"]'         "${PROJECT_NAME}-cart"
+          import_if_exists 'aws_ecr_repository.service["catalog"]'      "${PROJECT_NAME}-catalog"
+          import_if_exists 'aws_ecr_repository.service["frontend"]'     "${PROJECT_NAME}-frontend"
+          import_if_exists 'aws_ecr_repository.service["gateway"]'      "${PROJECT_NAME}-gateway"
+          import_if_exists 'aws_ecr_repository.service["notification"]' "${PROJECT_NAME}-notification"
+          import_if_exists 'aws_ecr_repository.service["order"]'        "${PROJECT_NAME}-order"
+          import_if_exists 'aws_ecr_repository.service["payment"]'      "${PROJECT_NAME}-payment"
+
+          # CloudWatch Log Groups
+          import_if_exists 'aws_cloudwatch_log_group.service["cart"]'         "/ecs/${PROJECT_NAME}/cart"
+          import_if_exists 'aws_cloudwatch_log_group.service["catalog"]'      "/ecs/${PROJECT_NAME}/catalog"
+          import_if_exists 'aws_cloudwatch_log_group.service["frontend"]'     "/ecs/${PROJECT_NAME}/frontend"
+          import_if_exists 'aws_cloudwatch_log_group.service["gateway"]'      "/ecs/${PROJECT_NAME}/gateway"
+          import_if_exists 'aws_cloudwatch_log_group.service["notification"]' "/ecs/${PROJECT_NAME}/notification"
+          import_if_exists 'aws_cloudwatch_log_group.service["order"]'        "/ecs/${PROJECT_NAME}/order"
+          import_if_exists 'aws_cloudwatch_log_group.service["payment"]'      "/ecs/${PROJECT_NAME}/payment"
+
+          # RDS and ElastiCache Subnet Groups
+          import_if_exists aws_db_subnet_group.main          "${PROJECT_NAME}-db-subnets"
+          import_if_exists aws_elasticache_subnet_group.main "${PROJECT_NAME}-cache-subnets"
+
       - name: Check whether ECR repositories already exist
         id: bootstrap
         shell: bash
@@ -216,4 +255,3 @@ jobs:
             echo "- Cloud Map namespace: ${cloud_map_namespace}"
           } >> "$GITHUB_STEP_SUMMARY"
         working-directory: infra/terraform
-
