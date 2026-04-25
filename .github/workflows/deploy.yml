@@ -155,9 +155,80 @@ jobs:
           import_if_exists 'aws_cloudwatch_log_group.service["order"]'        "/ecs/${PROJECT_NAME}/order"
           import_if_exists 'aws_cloudwatch_log_group.service["payment"]'      "/ecs/${PROJECT_NAME}/payment"
 
-          # RDS and ElastiCache Subnet Groups
-          import_if_exists aws_db_subnet_group.main          "${PROJECT_NAME}-db-subnets"
-          import_if_exists aws_elasticache_subnet_group.main "${PROJECT_NAME}-cache-subnets"
+          # ---------------------------------------------------------------
+          # RDS Subnet Group
+          # If the existing subnet group belongs to a different VPC than the
+          # one Terraform just created, it cannot be updated in-place.
+          # Delete it from AWS + state so Terraform recreates it cleanly.
+          # ---------------------------------------------------------------
+          CURRENT_RDS_SUBNET=$(aws rds describe-db-subnet-groups \
+            --db-subnet-group-name "${PROJECT_NAME}-db-subnets" \
+            --query 'DBSubnetGroups[0].Subnets[0].SubnetIdentifier' \
+            --output text 2>/dev/null || echo "NONE")
+
+          if [[ "${CURRENT_RDS_SUBNET}" != "NONE" && "${CURRENT_RDS_SUBNET}" != "None" ]]; then
+            OLD_VPC=$(aws ec2 describe-subnets \
+              --subnet-ids "${CURRENT_RDS_SUBNET}" \
+              --query 'Subnets[0].VpcId' --output text 2>/dev/null || echo "NONE")
+            NEW_VPC=$(aws ec2 describe-subnets \
+              --subnet-ids subnet-08b672f4e496705f4 \
+              --query 'Subnets[0].VpcId' --output text 2>/dev/null || echo "NONE")
+
+            if [[ "${OLD_VPC}" != "${NEW_VPC}" ]]; then
+              echo "RDS subnet group is from old VPC (${OLD_VPC}) — deleting and letting Terraform recreate..."
+              terraform state rm aws_db_subnet_group.main || true
+              aws rds delete-db-subnet-group \
+                --db-subnet-group-name "${PROJECT_NAME}-db-subnets" || true
+            else
+              import_if_exists aws_db_subnet_group.main "${PROJECT_NAME}-db-subnets"
+            fi
+          fi
+
+          # ---------------------------------------------------------------
+          # ElastiCache Subnet Group + Redis Cluster
+          # Cannot update the subnet group while a Redis cluster is using it.
+          # If subnets are from a different VPC, delete cluster + subnet group
+          # so Terraform can recreate both.
+          # ---------------------------------------------------------------
+          CURRENT_CACHE_SUBNET=$(aws elasticache describe-cache-subnet-groups \
+            --cache-subnet-group-name "${PROJECT_NAME}-cache-subnets" \
+            --query 'CacheSubnetGroups[0].Subnets[0].SubnetIdentifier' \
+            --output text 2>/dev/null || echo "NONE")
+
+          if [[ "${CURRENT_CACHE_SUBNET}" != "NONE" && "${CURRENT_CACHE_SUBNET}" != "None" ]]; then
+            OLD_CACHE_VPC=$(aws ec2 describe-subnets \
+              --subnet-ids "${CURRENT_CACHE_SUBNET}" \
+              --query 'Subnets[0].VpcId' --output text 2>/dev/null || echo "NONE")
+            NEW_VPC=$(aws ec2 describe-subnets \
+              --subnet-ids subnet-08b672f4e496705f4 \
+              --query 'Subnets[0].VpcId' --output text 2>/dev/null || echo "NONE")
+
+            if [[ "${OLD_CACHE_VPC}" != "${NEW_VPC}" ]]; then
+              echo "ElastiCache subnet group is from old VPC (${OLD_CACHE_VPC}) — deleting Redis cluster first..."
+
+              CLUSTER_STATUS=$(aws elasticache describe-cache-clusters \
+                --cache-cluster-id "${PROJECT_NAME}-redis" \
+                --query 'CacheClusters[0].CacheClusterStatus' \
+                --output text 2>/dev/null || echo "NONE")
+
+              if [[ "${CLUSTER_STATUS}" != "NONE" && "${CLUSTER_STATUS}" != "None" ]]; then
+                echo "Deleting Redis cluster (status: ${CLUSTER_STATUS})..."
+                aws elasticache delete-cache-cluster \
+                  --cache-cluster-id "${PROJECT_NAME}-redis" || true
+                echo "Waiting for Redis deletion (up to 10 min)..."
+                aws elasticache wait cache-cluster-deleted \
+                  --cache-cluster-id "${PROJECT_NAME}-redis" || true
+              fi
+
+              aws elasticache delete-cache-subnet-group \
+                --cache-subnet-group-name "${PROJECT_NAME}-cache-subnets" || true
+
+              terraform state rm aws_elasticache_cluster.redis || true
+              terraform state rm aws_elasticache_subnet_group.main || true
+            else
+              import_if_exists aws_elasticache_subnet_group.main "${PROJECT_NAME}-cache-subnets"
+            fi
+          fi
 
       - name: Check whether ECR repositories already exist
         id: bootstrap
