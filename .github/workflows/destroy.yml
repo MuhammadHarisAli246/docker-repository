@@ -136,62 +136,43 @@ jobs:
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}" || true
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}.tflock" || true
 
-      - name: Install boto3 for bucket cleanup
-        if: github.event.inputs.destroy_backend_bucket == 'true'
-        shell: bash
-        run: pip install boto3 --quiet
-
       - name: Optionally delete the Terraform backend bucket
         if: github.event.inputs.destroy_backend_bucket == 'true'
-        shell: python
-        env:
-          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
-          AWS_REGION: ${{ env.AWS_REGION }}
+        shell: bash
         run: |
-          import boto3
-          import os
+          set -euo pipefail
+          pip install boto3 --quiet
+          python3 << 'PYEOF'
+          import boto3, os, sys
 
           bucket = os.environ["TF_STATE_BUCKET"]
           region = os.environ["AWS_REGION"]
 
           s3 = boto3.client("s3", region_name=region)
-
           print(f"Emptying bucket: {bucket}")
 
           paginator = s3.get_paginator("list_object_versions")
           delete_list = []
 
           for page in paginator.paginate(Bucket=bucket):
-              for version in page.get("Versions", []):
-                  delete_list.append({
-                      "Key": version["Key"],
-                      "VersionId": version["VersionId"]
-                  })
-              for marker in page.get("DeleteMarkers", []):
-                  delete_list.append({
-                      "Key": marker["Key"],
-                      "VersionId": marker["VersionId"]
-                  })
+              for v in page.get("Versions", []):
+                  delete_list.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+              for m in page.get("DeleteMarkers", []):
+                  delete_list.append({"Key": m["Key"], "VersionId": m["VersionId"]})
 
           print(f"Found {len(delete_list)} objects/versions/markers to delete.")
 
-          # Delete in batches of 1000 (S3 API limit)
           for i in range(0, len(delete_list), 1000):
-              batch = delete_list[i:i + 1000]
-              response = s3.delete_objects(
-                  Bucket=bucket,
-                  Delete={"Objects": batch, "Quiet": True}
-              )
-              errors = response.get("Errors", [])
-              if errors:
-                  for err in errors:
-                      print(f"ERROR: {err['Key']} ({err['VersionId']}): {err['Message']}")
-                  raise Exception("Some objects failed to delete.")
-              print(f"Deleted batch of {len(batch)} objects.")
+              batch = delete_list[i:i+1000]
+              resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+              if resp.get("Errors"):
+                  print(f"Errors: {resp['Errors']}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"Deleted batch of {len(batch)}")
 
-          print(f"Bucket emptied. Now deleting bucket: {bucket}")
           s3.delete_bucket(Bucket=bucket)
           print(f"SUCCESS: Bucket {bucket} deleted.")
+          PYEOF
 
       - name: Summarize destroy result
         shell: bash
