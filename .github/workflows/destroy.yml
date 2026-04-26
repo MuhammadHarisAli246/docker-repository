@@ -1,4 +1,4 @@
-﻿name: Destroy AWS Demo Stack
+name: Destroy AWS Demo Stack
 
 on:
   workflow_dispatch:
@@ -39,28 +39,25 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.14.8
+          terraform_version: 1.9.8
 
       - name: Validate required GitHub configuration
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ -z "${TF_STATE_BUCKET}" ]]; then
             echo "TF_STATE_BUCKET GitHub variable is required."
             exit 1
           fi
-
           if [[ -z "${AWS_ROLE_TO_ASSUME}" ]]; then
             echo "AWS_ROLE_TO_ASSUME GitHub variable is required."
             exit 1
           fi
-
           if [[ -z "${{ secrets.TF_VAR_db_password }}" ]]; then
             echo "TF_VAR_db_password GitHub secret is required."
             exit 1
@@ -70,14 +67,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ "${{ github.event.inputs.confirm_project_name }}" != "${PROJECT_NAME}" ]]; then
             echo "Confirmation failed. Type the exact project name: ${PROJECT_NAME}"
             exit 1
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
@@ -86,7 +82,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if ! aws s3api head-bucket --bucket "${TF_STATE_BUCKET}" 2>/dev/null; then
             echo "Terraform state bucket not found: ${TF_STATE_BUCKET}"
             echo "Nothing to destroy from the remote backend."
@@ -97,7 +92,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           cat > infra/terraform/backend.hcl <<EOF
           bucket       = "${TF_STATE_BUCKET}"
           key          = "${TF_STATE_KEY}"
@@ -124,14 +118,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           services=(frontend gateway catalog cart order payment notification)
-
           for service in "${services[@]}"; do
             repository_name="${PROJECT_NAME}-${service}"
-
             if aws ecr describe-repositories --region "${AWS_REGION}" --repository-names "${repository_name}" >/dev/null 2>&1; then
               aws ecr delete-repository --region "${AWS_REGION}" --repository-name "${repository_name}" --force
+              echo "Deleted ECR repository: ${repository_name}"
+            else
+              echo "ECR repository not found (skipping): ${repository_name}"
             fi
           done
 
@@ -139,7 +133,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}" || true
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}.tflock" || true
 
@@ -149,7 +142,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          aws s3 rb "s3://${TF_STATE_BUCKET}" --force
+          echo "Deleting all object versions from ${TF_STATE_BUCKET}..."
+
+          # Delete all object versions
+          VERSIONS=$(aws s3api list-object-versions --bucket "${TF_STATE_BUCKET}" \
+            --query 'Versions[].{Key:Key,VersionId:VersionId}' \
+            --output json 2>/dev/null || echo "[]")
+
+          echo "$VERSIONS" | jq -c '.[]?' | while read obj; do
+            KEY=$(echo "$obj" | jq -r '.Key')
+            VID=$(echo "$obj" | jq -r '.VersionId')
+            aws s3api delete-object --bucket "${TF_STATE_BUCKET}" --key "$KEY" --version-id "$VID"
+            echo "Deleted version: $KEY ($VID)"
+          done
+
+          # Delete all delete markers
+          MARKERS=$(aws s3api list-object-versions --bucket "${TF_STATE_BUCKET}" \
+            --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' \
+            --output json 2>/dev/null || echo "[]")
+
+          echo "$MARKERS" | jq -c '.[]?' | while read obj; do
+            KEY=$(echo "$obj" | jq -r '.Key')
+            VID=$(echo "$obj" | jq -r '.VersionId')
+            aws s3api delete-object --bucket "${TF_STATE_BUCKET}" --key "$KEY" --version-id "$VID"
+            echo "Deleted marker: $KEY ($VID)"
+          done
+
+          echo "Removing bucket ${TF_STATE_BUCKET}..."
+          aws s3api delete-bucket --bucket "${TF_STATE_BUCKET}" --region "${AWS_REGION}"
+          echo "✅ Bucket deleted successfully"
 
       - name: Summarize destroy result
         shell: bash
@@ -161,4 +182,3 @@ jobs:
             echo "- Region: ${AWS_REGION}"
             echo "- State bucket removed: ${{ github.event.inputs.destroy_backend_bucket }}"
           } >> "$GITHUB_STEP_SUMMARY"
-
