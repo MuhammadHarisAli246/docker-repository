@@ -136,41 +136,62 @@ jobs:
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}" || true
           aws s3 rm "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}.tflock" || true
 
-      - name: Optionally delete the Terraform backend bucket
+      - name: Install boto3 for bucket cleanup
         if: github.event.inputs.destroy_backend_bucket == 'true'
         shell: bash
+        run: pip install boto3 --quiet
+
+      - name: Optionally delete the Terraform backend bucket
+        if: github.event.inputs.destroy_backend_bucket == 'true'
+        shell: python
+        env:
+          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
+          AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          set -euo pipefail
+          import boto3
+          import os
 
-          echo "Deleting all object versions from ${TF_STATE_BUCKET}..."
+          bucket = os.environ["TF_STATE_BUCKET"]
+          region = os.environ["AWS_REGION"]
 
-          # Delete all object versions
-          VERSIONS=$(aws s3api list-object-versions --bucket "${TF_STATE_BUCKET}" \
-            --query 'Versions[].{Key:Key,VersionId:VersionId}' \
-            --output json 2>/dev/null || echo "[]")
+          s3 = boto3.client("s3", region_name=region)
 
-          echo "$VERSIONS" | jq -c '.[]?' | while read obj; do
-            KEY=$(echo "$obj" | jq -r '.Key')
-            VID=$(echo "$obj" | jq -r '.VersionId')
-            aws s3api delete-object --bucket "${TF_STATE_BUCKET}" --key "$KEY" --version-id "$VID"
-            echo "Deleted version: $KEY ($VID)"
-          done
+          print(f"Emptying bucket: {bucket}")
 
-          # Delete all delete markers
-          MARKERS=$(aws s3api list-object-versions --bucket "${TF_STATE_BUCKET}" \
-            --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' \
-            --output json 2>/dev/null || echo "[]")
+          paginator = s3.get_paginator("list_object_versions")
+          delete_list = []
 
-          echo "$MARKERS" | jq -c '.[]?' | while read obj; do
-            KEY=$(echo "$obj" | jq -r '.Key')
-            VID=$(echo "$obj" | jq -r '.VersionId')
-            aws s3api delete-object --bucket "${TF_STATE_BUCKET}" --key "$KEY" --version-id "$VID"
-            echo "Deleted marker: $KEY ($VID)"
-          done
+          for page in paginator.paginate(Bucket=bucket):
+              for version in page.get("Versions", []):
+                  delete_list.append({
+                      "Key": version["Key"],
+                      "VersionId": version["VersionId"]
+                  })
+              for marker in page.get("DeleteMarkers", []):
+                  delete_list.append({
+                      "Key": marker["Key"],
+                      "VersionId": marker["VersionId"]
+                  })
 
-          echo "Removing bucket ${TF_STATE_BUCKET}..."
-          aws s3api delete-bucket --bucket "${TF_STATE_BUCKET}" --region "${AWS_REGION}"
-          echo "✅ Bucket deleted successfully"
+          print(f"Found {len(delete_list)} objects/versions/markers to delete.")
+
+          # Delete in batches of 1000 (S3 API limit)
+          for i in range(0, len(delete_list), 1000):
+              batch = delete_list[i:i + 1000]
+              response = s3.delete_objects(
+                  Bucket=bucket,
+                  Delete={"Objects": batch, "Quiet": True}
+              )
+              errors = response.get("Errors", [])
+              if errors:
+                  for err in errors:
+                      print(f"ERROR: {err['Key']} ({err['VersionId']}): {err['Message']}")
+                  raise Exception("Some objects failed to delete.")
+              print(f"Deleted batch of {len(batch)} objects.")
+
+          print(f"Bucket emptied. Now deleting bucket: {bucket}")
+          s3.delete_bucket(Bucket=bucket)
+          print(f"SUCCESS: Bucket {bucket} deleted.")
 
       - name: Summarize destroy result
         shell: bash
